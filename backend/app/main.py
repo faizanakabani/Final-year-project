@@ -1,10 +1,12 @@
 import asyncio
+import hashlib
 import re
 import json
 import os
 import uuid
 import io
 import logging
+from pathlib import Path
 from typing import List
 from urllib.parse import urljoin, urlparse
 
@@ -20,6 +22,9 @@ from dotenv import load_dotenv
 import uvicorn
 
 from llm_client import llm
+from supabase import create_client, Client
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from contextlib import asynccontextmanager
 
 # =====================================================
 # ENV + SETTINGS
@@ -27,6 +32,17 @@ from llm_client import llm
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 load_dotenv()
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Global variables for cleanup
+_supabase_channel = None
+
+async def handle_content_changes(payload):
+    logger.info(f"Content changed: {payload}")
+    await sync_supabase_data()
 
 # =====================================================
 # LOGGING CONFIG
@@ -43,7 +59,60 @@ logger = logging.getLogger("RAG-API")
 # FASTAPI INIT
 # =====================================================
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _supabase_channel, scheduler
+    
+    # Startup
+    try:
+        await ingest_heritage_pdf()
+        logger.info("Heritage PDF ingestion completed")
+    except Exception as e:
+        logger.error(f"Failed to ingest heritage PDF during startup: {e}")
+    
+    try:
+        await sync_supabase_data()
+        logger.info("Supabase sync completed")
+    except Exception as e:
+        logger.error(f"Failed to sync Supabase data during startup: {e}")
+    
+    try:
+        scheduler = AsyncIOScheduler()
+        scheduler.add_job(sync_supabase_data, 'interval', hours=1)
+        scheduler.start()
+        logger.info("Scheduler started")
+    except Exception as e:
+        logger.error(f"Failed to start scheduler: {e}")
+    
+    # Setup Supabase subscription (non-blocking)
+    try:
+        _supabase_channel = supabase.channel('content_changes')
+        _supabase_channel.on('postgres_changes', {'event': '*', 'schema': 'public', 'table': 'content'}, lambda payload: asyncio.create_task(handle_content_changes(payload)))
+        await asyncio.wait_for(supabase.subscribe(_supabase_channel), timeout=5.0)
+        logger.info("Supabase subscription established")
+    except asyncio.TimeoutError:
+        logger.warning("Supabase subscription timed out, continuing without it")
+    except Exception as e:
+        logger.error(f"Failed to setup Supabase subscription: {e}")
+    
+    yield
+    
+    # Shutdown
+    if _supabase_channel:
+        try:
+            await supabase.unsubscribe(_supabase_channel)
+            logger.info("Supabase subscription closed")
+        except Exception as e:
+            logger.error(f"Error during unsubscribe: {e}")
+    
+    if 'scheduler' in globals():
+        try:
+            scheduler.shutdown()
+            logger.info("Scheduler shut down")
+        except Exception as e:
+            logger.error(f"Error shutting down scheduler: {e}")
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -108,6 +177,94 @@ class QueryRequest(BaseModel):
 
 
 # =====================================================
+# SYNC SUPABASE DATA
+# =====================================================
+
+async def sync_supabase_data():
+    try:
+        # Fetch content
+        response = supabase.table('content').select('*').execute()
+        contents = response.data
+
+        for content in contents:
+            text = f"{content.get('title', '')} {content.get('description', '')} {content.get('longDescription', '')} {content.get('howTo', '')} {content.get('whatTo', '')}"
+            if not text.strip():
+                continue
+
+            # Split and store
+            chunks = text_splitter.split_text(text)
+            valid_chunks = [c for c in chunks if c.strip()]
+
+            if not valid_chunks:
+                continue
+
+            embeddings = []
+            ids = []
+            metadatas = []
+
+            for idx, chunk in enumerate(valid_chunks):
+                embedding = embedding_function.embed_query(chunk)
+                chunk_id = f"supabase:{content.get('id', uuid.uuid4())}:{idx}"
+
+                metadata = {
+                    "knowledge_id": "goa",
+                    "user_id": "admin",
+                    "content_id": str(content.get('id', '')),
+                    "title": content.get('title', ''),
+                    "category": content.get('category', ''),
+                    "latitude": str(content.get('latitude', '')),
+                    "longitude": str(content.get('longitude', '')),
+                    "imageUrl": content.get('imageUrl', ''),
+                    "createdAt": content.get('createdAt', ''),
+                }
+
+                embeddings.append(embedding)
+                ids.append(chunk_id)
+                metadatas.append(metadata)
+
+            # Upsert to Chroma
+            collection.upsert(
+                documents=valid_chunks,
+                embeddings=embeddings,
+                metadatas=metadatas,
+                ids=ids,
+            )
+
+        logger.info(f"Synced {len(contents)} content items from Supabase")
+
+    except Exception as e:
+        logger.error(f"Error syncing Supabase data: {e}")
+
+
+async def ingest_heritage_pdf():
+    try:
+        project_root = Path(__file__).resolve().parent.parent
+        pdf_path = project_root / "goa_heritage_structures_notes (1).pdf"
+
+        if not pdf_path.exists():
+            logger.warning(f"PDF not found at {pdf_path}")
+            return
+
+        with pdf_path.open('rb') as f:
+            contents = f.read()
+
+        reader = PdfReader(io.BytesIO(contents))
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() or ""
+
+        knowledge_id = "goa"
+        user_id = "admin"
+
+        await store_text(text, knowledge_id, user_id, "goa_heritage_structures_notes.pdf", is_url=False)
+
+        logger.info("Ingested heritage PDF")
+
+    except Exception as e:
+        logger.error(f"Error ingesting heritage PDF: {e}")
+
+
+# =====================================================
 # STORE TEXT
 # =====================================================
 
@@ -127,7 +284,8 @@ async def store_text(text, knowledge_id, user_id, link=None, is_url=True):
     for chunk in valid_chunks:
         embedding = embedding_function.embed_query(chunk)
 
-        chunk_id = str(uuid.uuid4())
+        chunk_hash = hashlib.sha256(chunk.encode('utf-8')).hexdigest()
+        chunk_id = f"{knowledge_id}:{user_id}:{chunk_hash}"
 
         metadata = {
             "knowledge_id": knowledge_id,
@@ -144,7 +302,7 @@ async def store_text(text, knowledge_id, user_id, link=None, is_url=True):
         ids.append(chunk_id)
         metadatas.append(metadata)
 
-    collection.add(
+    collection.upsert(
         documents=valid_chunks,
         embeddings=embeddings,
         metadatas=metadatas,
@@ -298,12 +456,17 @@ async def query(request: QueryRequest):
             include=["documents", "metadatas"],
         )
 
-        # ✅ STRICT MODE
-        if (
-            not results["documents"]
-            or len(results["documents"][0]) == 0
-        ):
-            logger.warning("No context found. Blocking answer.")
+        if not results["documents"] or len(results["documents"][0]) == 0:
+            logger.warning("No context found with strict metadata filter. Trying fallback search.")
+            results = collection.query(
+                query_embeddings=[embedded_query],
+                n_results=5,
+                where={"user_id": request.user_id},
+                include=["documents", "metadatas"],
+            )
+
+        if not results["documents"] or len(results["documents"][0]) == 0:
+            logger.warning("No context found after fallback search. Blocking answer.")
             return {
                 "response": "No relevant data found in knowledge base.",
                 "sources": [],
@@ -312,31 +475,50 @@ async def query(request: QueryRequest):
         context = "\n\n".join(results["documents"][0])
 
         # LLM CALL ONLY WHEN CONTEXT EXISTS
-        chat_completion = await llm.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Answer ONLY using provided context. "
-                        "If answer is not present, reply exactly: "
-                        "'No relevant data found in knowledge base.'"
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": f"Context:\n{context}\n\nQuestion:{request.query}",
-                },
-            ],
-        )
+        try:
+            logger.info("Calling LLM API...")
+            chat_completion = await asyncio.wait_for(
+                llm.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "Answer ONLY using provided context. "
+                                "If answer is not present, reply exactly: "
+                                "'No relevant data found in knowledge base.'"
+                            ),
+                        },
+                        {
+                            "role": "user",
+                            "content": f"Context:\n{context}\n\nQuestion:{request.query}",
+                        },
+                    ],
+                ),
+                timeout=25.0  # 25 second timeout for LLM call
+            )
+            logger.info("LLM API call completed successfully")
+            return {
+                "response": chat_completion.choices[0].message.content,
+                "sources": results["metadatas"][0],
+            }
+        except asyncio.TimeoutError:
+            logger.error("LLM API call timed out after 25 seconds")
+            raise HTTPException(
+                status_code=504,
+                detail="LLM API call timed out. Please try again."
+            )
+        except Exception as llm_error:
+            logger.error(f"LLM API error: {llm_error}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"LLM API error: {str(llm_error)}"
+            )
 
-        return {
-            "response": chat_completion.choices[0].message.content,
-            "sources": results["metadatas"][0],
-        }
-
+    except HTTPException:
+        raise
     except Exception as e:
-        logger.error(e)
+        logger.error(f"Query processing error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
